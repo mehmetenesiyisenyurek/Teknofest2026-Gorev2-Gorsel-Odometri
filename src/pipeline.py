@@ -13,8 +13,7 @@ Faz Yönetimi:
         Pozisyonu GT'ye sıfırla + kalibrasyon güncelle + GT gönder
 
 Bireysel test:
-    python -m src.pipeline --video /home/mei/Benim/PROJECTS/Teknofest26/src/data/THYZ_2026_Ornek_Veri_1.MP4 --gt /home/mei/Benim/PROJECTS/Teknofest26/src/data/THYZ_2026_Ornek_Veri_1_translation.csv --max-frames 200
-
+    python -m src.pipeline --video /home/mei/Benim/PROJECTS/Teknofest26/src/data/THYZ_2026_Ornek_Veri_1.MP4 --gt /home/mei/Benim/PROJECTS/Teknofest26/src/data/THYZ_2026_Ornek_Veri_1_translation.csv  --max-frames 200 --gps-cut 50
 """
 
 import sys
@@ -24,20 +23,16 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-
-import torch
+import  torch
 
 if not torch.cuda.is_available():
     print("⚠️ Sistemde NVIDIA GPU bulunamadı. Pipeline testi için CPU yaması aktif ediliyor...")
-
     orig_linspace = torch.linspace
-
 
     def patched_linspace(*args, **kwargs):
         if 'device' in kwargs and kwargs['device'] == 'cuda':
             kwargs['device'] = 'cpu'
         return orig_linspace(*args, **kwargs)
-
 
     torch.linspace = patched_linspace
 else:
@@ -201,7 +196,9 @@ def run_pipeline(
     prev_frame = None
     prev_altitude = None
     results = {}  # {frame_id: (x, y, z)}
+    results_vo = {}  # {frame_id: (x, y, z)} — kalibrasyon öncesi ham VO
     phase = "calibration"
+    prev_phase = "calibration"
     keyframe_count = 0
     calibrated = False
 
@@ -212,6 +209,7 @@ def run_pipeline(
         "skipped": 0,
         "rotation_only": 0,
         "homography_fail": 0,
+        "prediction_frames": 0,
         "phase_changes": [],
     }
 
@@ -231,11 +229,18 @@ def run_pipeline(
         gps_health = simulate_gps_health(fid, gt_data, gps_cut_start)
         gt_pos = gt_data.get(fid) if gt_data else None
 
-        # Faz belirle
-        if gps_health == 1 and not calibrated:
-            new_phase = "calibration"
-        elif gps_health == 1 and calibrated:
-            new_phase = "reset"
+        # Faz belirle:
+        #   calibration:      GT var, kalibrasyon tamamlanmadı
+        #   calibration_done: GT var, kalibrasyon tamamlandı (GT gönder + örnek topla)
+        #   prediction:       GT yok → VO + kalibrasyon dönüşümü
+        #   reset:            GT yok → GT döndü (bir kez sıfırla, sonra calibration_done)
+        if gps_health == 1:
+            if not calibrated:
+                new_phase = "calibration"
+            elif prev_phase == "prediction":
+                new_phase = "reset"  # GT geri döndü — bir kez reset
+            else:
+                new_phase = "calibration_done"  # GT var, kalibrasyon tamam
         else:
             new_phase = "prediction"
 
@@ -244,6 +249,8 @@ def run_pipeline(
             if verbose:
                 print(f"\n   📌 Faz değişimi → {new_phase.upper()} (kare {fid})")
             phase = new_phase
+
+        prev_phase = phase
 
         # ── 2. Ön işleme ──
         enhanced, undistorted = prep.preprocess(frame)
@@ -279,17 +286,15 @@ def run_pipeline(
             stats["skipped"] += 1
 
             # Sonucu belirle
-            if phase == "calibration" and gt_pos is not None:
+            if phase in ("calibration", "calibration_done", "reset") and gt_pos is not None:
                 results[fid] = gt_pos
             elif phase == "prediction" and calibrator.is_calibrated:
-                # Son bilinen VO pozisyonunu dönüştür
                 vo_pos = accumulator.get_vo_position()
                 world_pos = calibrator.transform(vo_pos)
                 results[fid] = tuple(world_pos)
-            elif phase == "reset" and gt_pos is not None:
-                results[fid] = gt_pos
+                results_vo[fid] = tuple(world_pos)  # VO tahminini kaydet
+                stats["prediction_frames"] += 1
             else:
-                # Fallback: son bilinen pozisyon
                 last_pos = accumulator.get_position()
                 results[fid] = tuple(last_pos) if last_pos is not None else (0, 0, 0)
 
@@ -358,11 +363,9 @@ def run_pipeline(
 
         if phase == "calibration":
             if gt_pos is not None:
-                # Kalibrasyon örneği ekle
                 calibrator.add_sample(vo_pos, np.array(gt_pos))
                 results[fid] = gt_pos
 
-                # Yeterli örnek birikti mi?
                 if calibrator.get_sample_count() >= 10 and not calibrator.is_calibrated:
                     if calibrator.calibrate():
                         calibrated = True
@@ -374,14 +377,27 @@ def run_pipeline(
             else:
                 results[fid] = tuple(vo_pos)
 
+        elif phase == "calibration_done":
+            # Kalibrasyon tamam ama GT hâlâ var → GT gönder + örnek biriktir
+            if gt_pos is not None:
+                calibrator.add_sample(vo_pos, np.array(gt_pos))
+                results[fid] = gt_pos
+            else:
+                world_pos = calibrator.transform(vo_pos)
+                results[fid] = tuple(world_pos)
+
         elif phase == "prediction":
+            stats["prediction_frames"] += 1
             if calibrator.is_calibrated:
                 world_pos = calibrator.transform(vo_pos)
                 results[fid] = tuple(world_pos)
+                results_vo[fid] = tuple(world_pos)  # VO tahminini kaydet
             else:
                 results[fid] = tuple(vo_pos)
+                results_vo[fid] = tuple(vo_pos)
 
         elif phase == "reset":
+            # GT geri döndü — bir kez sıfırla
             if gt_pos is not None:
                 accumulator.reset_to_gt(fid, np.array(gt_pos))
                 calibrator.update_on_gt_return(vo_pos, np.array(gt_pos))
@@ -426,6 +442,7 @@ def run_pipeline(
         print(f"   Skiplenen     : {stats['skipped']}")
         print(f"   Salt rotasyon : {stats['rotation_only']}")
         print(f"   H başarısız   : {stats['homography_fail']}")
+        print(f"   Tahmin karesi : {stats['prediction_frames']}")
         print(f"   Süre          : {elapsed:.1f}s ({stats['total_frames']/elapsed:.1f} fps)")
 
         if calibrator.is_calibrated:
@@ -450,20 +467,27 @@ def run_pipeline(
 
     # ── GT ile hata hesapla ──
     if gt_data and verbose:
-        errors = []
+        # Sadece TAHMİN fazındaki karelerde hata hesapla (dürüst metrik)
+        pred_errors = []
+        all_errors = []
         for fid, pred in results.items():
             if fid in gt_data:
                 gt = gt_data[fid]
                 err = np.sqrt((pred[0]-gt[0])**2 + (pred[1]-gt[1])**2 + (pred[2]-gt[2])**2)
-                errors.append(err)
+                all_errors.append(err)
+                if fid in results_vo:
+                    pred_errors.append(err)
 
-        if errors:
-            errors = np.array(errors)
-            print(f"\n   📐 GT Karşılaştırma (tüm kareler):")
-            print(f"     Ortalama hata : {np.mean(errors):.4f}m")
-            print(f"     Medyan hata   : {np.median(errors):.4f}m")
-            print(f"     Maks hata     : {np.max(errors):.4f}m")
-            print(f"     Min hata      : {np.min(errors):.4f}m")
+        if pred_errors:
+            pred_errors = np.array(pred_errors)
+            print(f"\n   📐 GT Karşılaştırma (sadece TAHMİN fazı: {len(pred_errors)} kare):")
+            print(f"     Ortalama hata : {np.mean(pred_errors):.4f}m")
+            print(f"     Medyan hata   : {np.median(pred_errors):.4f}m")
+            print(f"     Maks hata     : {np.max(pred_errors):.4f}m")
+            print(f"     Min hata      : {np.min(pred_errors):.4f}m")
+        elif all_errors:
+            print(f"\n   📐 Tahmin fazı yok — tüm kareler GT ile dolduruldu.")
+            print(f"     (GPS kesim noktasını düşürmeyi deneyin: --gps-cut 50)")
 
     return results
 
