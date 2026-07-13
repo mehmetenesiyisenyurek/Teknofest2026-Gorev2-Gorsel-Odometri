@@ -4,6 +4,17 @@ Ana Pipeline Modülü (pipeline.py)
 
 Tüm modülleri birleştirerek uçtan uca VO çalıştırır.
 
+İKİ YOL MİMARİSİ:
+    Birincil Yol (Homography):
+        H → ayrıştır → R, t_scene, n → irtifa ile ölçekle → poz biriktir
+        Kullanım: Düzlemsel sahneler (drone yukarıdan bakıyor)
+
+    Yedek Yol (Essential Matrix + PnP):
+        GRIC karar verir → Essential'dan R + PnP'den metrik t → poz biriktir
+        Kullanım: Düzlemsel olmayan sahneler (binalar, ağaçlar vb.)
+
+    Karar mekanizması: GRIC (Geometric Robust Information Criterion)
+
 Faz Yönetimi:
     Faz 1 — Kalibrasyon (gps_health=1, kare < 450):
         VO çalıştır + GT ile kalibrasyon örnekleri biriktir + GT gönder
@@ -23,21 +34,26 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import  torch
+import torch
 
+# --- DİNAMİK METRIC3D CUDA YAMASI (V2 - GRIC) ---
+# Eğer bilgisayarda CUDA (NVIDIA GPU) VARSA bu yama pasif kalır.
+# CUDA yoksa, sistemin çökmesini engellemek için fonksiyonu CPU'ya yönlendirir.
 if not torch.cuda.is_available():
-    print("⚠️ Sistemde NVIDIA GPU bulunamadı. Pipeline testi için CPU yaması aktif ediliyor...")
+    print("⚠️ Sistemde NVIDIA GPU bulunamadı. Pipeline v2 testi için CPU yaması aktif ediliyor...")
+
     orig_linspace = torch.linspace
+
 
     def patched_linspace(*args, **kwargs):
         if 'device' in kwargs and kwargs['device'] == 'cuda':
             kwargs['device'] = 'cpu'
         return orig_linspace(*args, **kwargs)
 
+
     torch.linspace = patched_linspace
 else:
-    print("🚀 NVIDIA GPU (CUDA) algılandı! Model tam performans ekran kartında çalışacak.")
-
+    print("🚀 NVIDIA GPU (CUDA) algılandı! İki Yol Mimarisi tam performans çalışacak.")
 
 def load_ground_truth(gt_path):
     """
@@ -67,7 +83,7 @@ def load_ground_truth(gt_path):
             continue
 
         # Tab veya virgül ayırıcı
-        parts = line.replace(",", " ").split()
+        parts = line.replace(",", "\t").split("\t")
         parts = [p.strip() for p in parts if p.strip()]
 
         if len(parts) < 4:
@@ -152,6 +168,7 @@ def run_pipeline(
     from src.geometry import (
         estimate_homography, is_planar, decompose_homography,
         check_rotation_only, compute_displacement, NormalTracker,
+        select_model_gric, estimate_pose_pnp,
     )
     from src.depth import AltitudeEstimator
     from src.calibration import VOCalibrator
@@ -179,6 +196,9 @@ def run_pipeline(
     normal_tracker = NormalTracker(alpha=0.3)
     K_new = prep.get_K_new()
 
+    # GRIC sigma: MAGSAC eşiğinin 1/3'ü (≈1 piksel gürültü)
+    sigma_gric = cfg.MAGSAC_THRESHOLD / 3.0
+
     # ── GT yükle ──
     gt_data = load_ground_truth(gt_path)
     if gt_data:
@@ -193,10 +213,11 @@ def run_pipeline(
 
     # ── State ──
     prev_feats = None
-    prev_frame = None
+    prev_frame = None       # BGR frame (depth estimation için)
+    prev_depth_map = None   # Önceki karenin derinlik haritası (PnP yedek yol için)
     prev_altitude = None
-    results = {}  # {frame_id: (x, y, z)}
-    results_vo = {}  # {frame_id: (x, y, z)} — kalibrasyon öncesi ham VO
+    results = {}            # {frame_id: (x, y, z)}
+    results_vo = {}         # {frame_id: (x, y, z)} — kalibrasyon öncesi ham VO
     phase = "calibration"
     prev_phase = "calibration"
     keyframe_count = 0
@@ -208,13 +229,16 @@ def run_pipeline(
         "keyframes": 0,
         "skipped": 0,
         "rotation_only": 0,
-        "homography_fail": 0,
+        "homography_used": 0,   # Birincil yol kullanım sayısı
+        "pnp_used": 0,          # Yedek yol kullanım sayısı
+        "homography_fail": 0,   # Her iki yol da başarısız
         "prediction_frames": 0,
         "phase_changes": [],
     }
 
     print(f"\n🚀 Pipeline başlatılıyor...")
     print(f"   Maks kare: {max_frames} | GPS kesim: kare {gps_cut_start}")
+    print(f"   GRIC sigma: {sigma_gric:.2f}px")
     print(f"{'─' * 60}")
 
     t_start = time.time()
@@ -262,8 +286,9 @@ def run_pipeline(
             prev_feats = feats
             prev_frame = frame
 
-            # İlk kare için irtifa
+            # İlk kare için irtifa ve derinlik haritası
             prev_altitude = depth_est.estimate_altitude(frame)
+            prev_depth_map = depth_est.estimate_depth_map(frame)
 
             # İlk kare sonucu
             if gt_pos is not None:
@@ -292,7 +317,7 @@ def run_pipeline(
                 vo_pos = accumulator.get_vo_position()
                 world_pos = calibrator.transform(vo_pos)
                 results[fid] = tuple(world_pos)
-                results_vo[fid] = tuple(world_pos)  # VO tahminini kaydet
+                results_vo[fid] = tuple(world_pos)
                 stats["prediction_frames"] += 1
             else:
                 last_pos = accumulator.get_position()
@@ -307,56 +332,135 @@ def run_pipeline(
         # 6. Homography
         H, mask, ratio = estimate_homography(pts0_c, pts1_c, cfg.MAGSAC_THRESHOLD)
 
-        if H is None or not is_planar(ratio, cfg.HOMOGRAPHY_INLIER_THRESHOLD):
+        # ── 7. GRIC Model Seçimi ──
+        #
+        # Üç durum var:
+        #   a) H bulunamadı veya çok düşük inlier → doğrudan yedek yola git
+        #   b) GRIC "homography" dedi → birincil yol
+        #   c) GRIC "essential" dedi → yedek yol
+        #
+        selected_path = None  # "homography", "essential", veya None (başarısız)
+
+        if H is not None and ratio > 0.30:
+            # Yeterli inlier var — GRIC ile karar ver
+            model, gric_h, gric_f = select_model_gric(
+                pts0_c, pts1_c, K_new, H, sigma=sigma_gric
+            )
+            selected_path = model
+
+            if verbose and keyframe_count <= 20:
+                print(f"   KF#{keyframe_count} kare={fid}: "
+                      f"GRIC → {model.upper()} "
+                      f"(H={gric_h:.0f}, F={gric_f:.0f}, Δ={abs(gric_h-gric_f):.0f})")
+        else:
+            # H tamamen başarısız — yedek yola git
+            selected_path = "essential"
+            if verbose and keyframe_count <= 20:
+                print(f"   KF#{keyframe_count} kare={fid}: "
+                      f"H başarısız (ratio={ratio:.2%}) → ESSENTIAL")
+
+        # ──────────────────────────────────────────────────
+        # BİRİNCİL YOL: Homography Ayrıştırma
+        # ──────────────────────────────────────────────────
+        R = None
+        dx, dy, dz = 0.0, 0.0, 0.0
+        pose_success = False
+
+        if selected_path == "homography":
+            # H ayrıştırma
+            R_h, t_scene, normal_raw, h_success = decompose_homography(
+                H, K_new, pts0_c, pts1_c, mask
+            )
+
+            if h_success:
+                # Normal tracking
+                median_disp = float(np.median(np.linalg.norm(pts1_c - pts0_c, axis=1)))
+                normal_tracker.update(normal_raw, median_disp)
+
+                # Salt rotasyon kontrolü
+                rot_only = check_rotation_only(
+                    R_h, pts0_c, pts1_c, K_new, cfg.ROTATION_ONLY_THRESHOLD_PX
+                )
+
+                if rot_only:
+                    stats["rotation_only"] += 1
+                    R = R_h
+                    dx, dy, dz = 0.0, 0.0, 0.0
+                    pose_success = True
+                else:
+                    # İrtifa tahmini
+                    altitude = depth_est.estimate_altitude(frame)
+                    if prev_altitude is None:
+                        prev_altitude = altitude
+
+                    # Yer değiştirme (birincil yol — irtifa ile ölçekleme)
+                    dx, dy, dz = compute_displacement(t_scene, altitude, prev_altitude)
+                    R = R_h
+                    pose_success = True
+                    prev_altitude = altitude
+
+                stats["homography_used"] += 1
+            else:
+                # H ayrıştırma başarısız — yedek yola düş
+                selected_path = "essential"
+
+        # ──────────────────────────────────────────────────
+        # YEDEK YOL: Essential Matrix + PnP
+        # ──────────────────────────────────────────────────
+        if selected_path == "essential" and not pose_success:
+            # Derinlik haritası gerekli — önceki kareninki kullanılır
+            if prev_depth_map is not None:
+                R_pnp, t_metric, pnp_success = estimate_pose_pnp(
+                    pts0_c, pts1_c, K_new, prev_depth_map
+                )
+
+                if pnp_success:
+                    R = R_pnp
+
+                    # PnP konvansiyonu:
+                    #   estimate_pose_pnp: t_camera = -R.T @ t_pnp
+                    #   Bu, kamera yer değiştirmesini önceki kamera frame'inde verir.
+                    #
+                    # Accumulator konvansiyonu:
+                    #   camera_to_world: world_disp = R_global @ [dx, dy, dz]
+                    #   R_global güncellenmeden ÖNCE uygulanır (bakınız pose.py satır 110-117)
+                    #   Bu yüzden dx,dy,dz mevcut R_global'ın frame'inde olmalı
+                    #   = önceki kameranın frame'i (çünkü R_global henüz güncellenmedi)
+                    #
+                    # SONUÇ: t_camera zaten önceki frame'de → doğrudan kullan
+
+                    dx = float(t_metric[0])
+                    dy = float(t_metric[1])
+                    # dz: PnP'den gelen z genelde gürültülü —
+                    # irtifa farkından hesapla (Metric3D daha güvenilir)
+                    altitude = depth_est.estimate_altitude(frame)
+                    if prev_altitude is None:
+                        prev_altitude = altitude
+                    dz = altitude - prev_altitude
+                    prev_altitude = altitude
+
+                    pose_success = True
+                    stats["pnp_used"] += 1
+
+                    if verbose and keyframe_count <= 20:
+                        print(f"      PnP başarılı: dx={dx:+.4f}m dy={dy:+.4f}m dz={dz:+.4f}m")
+
+        # ── Poz başarısız mı? ──
+        if not pose_success:
             stats["homography_fail"] += 1
             accumulator.skip(fid)
             prev_feats = feats
             prev_frame = frame
 
-            # Sonuç: önceki pozisyon
+            # Derinlik haritasını güncelle (bir sonraki keyframe için)
+            prev_depth_map = depth_est.estimate_depth_map(frame)
+
             last_pos = accumulator.get_position()
             results[fid] = tuple(last_pos) if last_pos is not None else (0, 0, 0)
             continue
 
-        # 7. H ayrıştırma
-        R, t_scene, normal_raw, success = decompose_homography(
-            H, K_new, pts0_c, pts1_c, mask
-        )
-
-        if not success:
-            accumulator.skip(fid)
-            prev_feats = feats
-            prev_frame = frame
-            last_pos = accumulator.get_position()
-            results[fid] = tuple(last_pos) if last_pos is not None else (0, 0, 0)
-            continue
-
-        # Normal tracking
-        median_disp = float(np.median(np.linalg.norm(pts1_c - pts0_c, axis=1)))
-        normal_tracker.update(normal_raw, median_disp)
-
-        # 8. Salt rotasyon kontrolü
-        rot_only = check_rotation_only(
-            R, pts0_c, pts1_c, K_new, cfg.ROTATION_ONLY_THRESHOLD_PX
-        )
-
-        if rot_only:
-            stats["rotation_only"] += 1
-            # Rotasyon uygula, öteleme=0
-            accumulator.accumulate(R, 0.0, 0.0, 0.0, fid)
-        else:
-            # 9. İrtifa tahmini
-            altitude = depth_est.estimate_altitude(frame)
-            if prev_altitude is None:
-                prev_altitude = altitude
-
-            # 10. Yer değiştirme
-            dx, dy, dz = compute_displacement(t_scene, altitude, prev_altitude)
-
-            # 11. Poz biriktir
-            accumulator.accumulate(R, dx, dy, dz, fid)
-
-            prev_altitude = altitude
+        # ── 11. Poz biriktir ──
+        accumulator.accumulate(R, dx, dy, dz, fid)
 
         # ── FAZ-SPESİFİK İŞLEMLER ──
         vo_pos = accumulator.get_vo_position()
@@ -409,13 +513,23 @@ def run_pipeline(
         prev_feats = feats
         prev_frame = frame
 
+        # Derinlik haritasını güncelle (yedek yol bir sonraki sefer kullanabilir)
+        # NOT: Her keyframe'de depth map hesaplamak pahalı.
+        # Sadece GRIC "essential" seçtiğinde veya ratio düşükse hesapla.
+        if selected_path == "essential" or (ratio is not None and ratio < 0.85):
+            prev_depth_map = depth_est.estimate_depth_map(frame)
+        # Aksi halde önceki depth_map kullanılmaya devam eder
+
         # Verbose çıktı (her 10 keyframe'de)
         if verbose and keyframe_count % 10 == 0:
             pos = accumulator.get_position()
             elapsed = time.time() - t_start
             fps_actual = stats["total_frames"] / elapsed if elapsed > 0 else 0
+            h_pct = stats["homography_used"] / max(stats["keyframes"], 1) * 100
+            p_pct = stats["pnp_used"] / max(stats["keyframes"], 1) * 100
             print(f"   KF#{keyframe_count:>4d} kare={fid:>5d} "
                   f"pos=[{pos[0]:>8.2f},{pos[1]:>8.2f},{pos[2]:>8.2f}] "
+                  f"H:{h_pct:.0f}% PnP:{p_pct:.0f}% "
                   f"({fps_actual:.1f} fps)")
 
     # ── İnterpolasyon ──
@@ -441,7 +555,9 @@ def run_pipeline(
         print(f"   Keyframe      : {stats['keyframes']}")
         print(f"   Skiplenen     : {stats['skipped']}")
         print(f"   Salt rotasyon : {stats['rotation_only']}")
-        print(f"   H başarısız   : {stats['homography_fail']}")
+        print(f"   Birincil (H)  : {stats['homography_used']}")
+        print(f"   Yedek (PnP)   : {stats['pnp_used']}")
+        print(f"   Başarısız     : {stats['homography_fail']}")
         print(f"   Tahmin karesi : {stats['prediction_frames']}")
         print(f"   Süre          : {elapsed:.1f}s ({stats['total_frames']/elapsed:.1f} fps)")
 
@@ -539,7 +655,7 @@ if __name__ == "__main__":
         args.device = "cpu"
 
     print("=" * 60)
-    print("  pipeline.py — Visual Odometry Pipeline")
+    print("  pipeline.py — Visual Odometry Pipeline (v2 — GRIC)")
     print(f"  Cihaz: {args.device} | Profil: {cfg.CAMERA_PROFILE}")
     print(f"  Video: {Path(args.video).name}")
     print("=" * 60)
@@ -556,5 +672,5 @@ if __name__ == "__main__":
     )
 
     print(f"\n{'=' * 60}")
-    print("  ✅ Pipeline testi tamamlandı")
+    print("  ✅ Pipeline testi tamamlandı (v2 — GRIC + Yedek Yol)")
     print("=" * 60)
