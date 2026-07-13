@@ -3,11 +3,24 @@ Teknofest 2026 — Visual Odometry Pipeline
 Derinlik/İrtifa Modülü (depth.py)
 
 Metric3D v2 (vit_small) ile tek görüntüden metrik derinlik tahmini.
-Pipeline'da irtifa (altitude) tahmini için kullanılır.
+
+İKİ KULLANIM ALANI:
+    1. İrtifa Tahmini (Birincil Yol):
+        Derinlik haritasının medyanı → irtifa (metre)
+        H ayrıştırmasından gelen normalize t'yi ölçeklemek için kullanılır.
+
+    2. Derinlik Haritası (Yedek Yol — PnP):
+        Piksel başına metre cinsinden derinlik → 2D noktaları 3D'ye backproject
+        solvePnPRansac ile metrik yer değiştirme hesaplamak için kullanılır.
 
 NOT: Yarışma formatında ölçek GT'den kalibre edilir.
 Depth modelinin mutlak doğruluğu kritik değil —
 göreceli irtifa değişimini (ΔZ) doğru yakalaması yeterli.
+
+PERFORMANS:
+    estimate_altitude_and_depth() metodu tek inference ile hem irtifa hem
+    depth_map döndürür. Pipeline'da çift model çalıştırmayı önler.
+    CPU'da ~14s, CUDA'da ~0.05s per frame.
 
 Metric3D API:
     model = torch.hub.load('yvanyin/metric3d', 'metric3d_vit_small', pretrain=True)
@@ -29,12 +42,16 @@ import torch.nn.functional as F
 
 class AltitudeEstimator:
     """
-    Metric3D v2 ile irtifa tahmini.
+    Metric3D v2 ile irtifa ve derinlik tahmini.
 
     Akış:
         frame_bgr → RGB → resize (616×1064) → normalize
         → Metric3D → canonical depth → de-canonicalize (× fx_scaled/1000)
         → medyan → EMA yumuşatma → irtifa (metre)
+
+    Pipeline Entegrasyonu:
+        Birincil yol: altitude = estimator.estimate_altitude(frame)
+        Yedek yol:    altitude, depth_map = estimator.estimate_altitude_and_depth(frame)
     """
 
     # Metric3D'nin beklediği girdi boyutu
@@ -77,16 +94,27 @@ class AltitudeEstimator:
         self.mean = self.MEAN.to(self.device).view(1, 3, 1, 1)
         self.std = self.STD.to(self.device).view(1, 3, 1, 1)
 
+    # ──────────────────────────────────────────────────────────
+    # Ön İşleme
+    # ──────────────────────────────────────────────────────────
+
     def _preprocess_for_metric3d(self, frame_bgr):
         """
         BGR frame'i Metric3D'nin beklediği formata dönüştürür.
+
+        Adımlar:
+            1. BGR → RGB
+            2. Aspect ratio koruyarak resize (hedef: 616×1064)
+            3. Sağa ve alta siyah padding
+            4. Tensor'a çevir + ImageNet normalize
+            5. De-canonicalize çarpanını hesapla
 
         Args:
             frame_bgr: (H, W, 3) BGR numpy array.
 
         Returns:
             input_tensor: (1, 3, 616, 1064) normalize edilmiş tensor.
-            pad_info:     (pad_h, pad_w) — çıktıyı orijinal boyuta kırpmak için.
+            pad_info:     (pad_h, pad_w, new_h, new_w) — çıktıyı kırpmak için.
             scale:        fx_scaled / 1000 — de-canonicalize çarpanı.
         """
         # BGR → RGB
@@ -130,10 +158,18 @@ class AltitudeEstimator:
 
         return tensor, (pad_h, pad_w, new_h, new_w), decanon_scale
 
+    # ──────────────────────────────────────────────────────────
+    # Derinlik Haritası
+    # ──────────────────────────────────────────────────────────
+
     @torch.no_grad()
     def estimate_depth_map(self, frame_bgr):
         """
         Tek bir frame'den metrik derinlik haritası üretir.
+
+        Akış:
+            preprocess → Metric3D inference → de-canonicalize
+            → padding kırp → orijinal boyuta resize
 
         Args:
             frame_bgr: (H, W, 3) BGR numpy array.
@@ -145,7 +181,7 @@ class AltitudeEstimator:
             self._preprocess_for_metric3d(frame_bgr)
 
         # ── Inference ──
-        pred_depth, confidence,_ = self.model.inference({'input': input_tensor})
+        pred_depth, confidence = self.model.inference({'input': input_tensor})
 
         # ── De-canonicalize ──
         # Metric3D canonical space'de üretir (focal=1000 varsayımı).
@@ -167,6 +203,10 @@ class AltitudeEstimator:
 
         return depth_map
 
+    # ──────────────────────────────────────────────────────────
+    # İrtifa Tahmini
+    # ──────────────────────────────────────────────────────────
+
     def estimate_altitude(self, frame_bgr):
         """
         Tek bir frame'den drone irtifası tahmin eder.
@@ -174,21 +214,50 @@ class AltitudeEstimator:
         Derinlik haritasının medyanını alır (outlier'lara karşı robust)
         ve EMA ile yumuşatır.
 
+        NOT: İçeride estimate_altitude_and_depth() çağırır.
+        Eğer hem altitude hem depth_map gerekiyorsa,
+        doğrudan estimate_altitude_and_depth() kullanın.
+
         Args:
             frame_bgr: (H, W, 3) BGR numpy array.
 
         Returns:
             altitude: Yumuşatılmış irtifa (metre, float).
         """
+        altitude, _ = self.estimate_altitude_and_depth(frame_bgr)
+        return altitude
+
+    def estimate_altitude_and_depth(self, frame_bgr):
+        """
+        Tek bir frame'den hem irtifa hem derinlik haritası üretir.
+
+        Metric3D inference'ı BİR KEZ çalıştırır ve her iki sonucu da döndürür.
+        Pipeline'da hem irtifa (Homography ölçekleme) hem depth_map
+        (PnP yedek yol) gerektiğinde çift inference'dan kaçınır.
+
+        Akış:
+            estimate_depth_map(frame) → depth_map
+            medyan(depth_map) → raw_altitude
+            fiziksel kısıtlar → clip
+            EMA yumuşatma → altitude
+
+        Args:
+            frame_bgr: (H, W, 3) BGR numpy array.
+
+        Returns:
+            altitude:  Yumuşatılmış irtifa (metre, float).
+            depth_map: (H, W) metre cinsinden derinlik haritası.
+        """
         depth_map = self.estimate_depth_map(frame_bgr)
 
         # ── Medyan irtifa (robust) ──
-        # Sıfır ve inf değerleri filtrele
+        # Sıfır, negatif ve inf değerleri filtrele
         valid = depth_map[(depth_map > 0) & np.isfinite(depth_map)]
 
         if len(valid) == 0:
             # Hiç geçerli piksel yoksa son tahmini koru
-            return self._smoothed_altitude if self._smoothed_altitude else 50.0
+            altitude = self._smoothed_altitude if self._smoothed_altitude else 50.0
+            return altitude, depth_map
 
         raw_altitude = float(np.median(valid))
 
@@ -198,11 +267,18 @@ class AltitudeEstimator:
         # ── EMA yumuşatma ──
         altitude = self._smooth(raw_altitude)
 
-        return altitude
+        return altitude, depth_map
+
+    # ──────────────────────────────────────────────────────────
+    # EMA Yumuşatma
+    # ──────────────────────────────────────────────────────────
 
     def _smooth(self, raw_altitude):
         """
         EMA yumuşatma + ani sıçrama koruması.
+
+        Normal değişim: standart EMA (alpha=0.2)
+        Ani sıçrama (>%50 sapma): düşürülmüş EMA (alpha=0.06)
 
         Args:
             raw_altitude: Ham irtifa tahmini (metre).
@@ -225,6 +301,10 @@ class AltitudeEstimator:
         self._smoothed_altitude = alpha * raw_altitude + (1 - alpha) * self._smoothed_altitude
 
         return self._smoothed_altitude
+
+    # ──────────────────────────────────────────────────────────
+    # Yardımcı Metodlar
+    # ──────────────────────────────────────────────────────────
 
     def get_last_altitude(self):
         """Son yumuşatılmış irtifayı döndürür."""
@@ -272,33 +352,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print("=" * 60)
-    print("  depth.py — Bireysel Test")
+    print("  depth.py — Bireysel Test (v2 — combined API)")
     print(f"  Cihaz: {args.device} | Profil: {CAMERA_PROFILE}")
     print("=" * 60)
 
     fx = float(CAMERA_K[0, 0])
-###################################################################################################
-#############         sonradan eklendi  ###########################################################
-###################################################################################################
-
-    if not torch.cuda.is_available():
-        print("⚠ Sistemde NVIDIA GPU bulunamadı. Geliştirme modu için CPU yaması aktif ediliyor...")
-
-        orig_linspace = torch.linspace
-
-
-        def patched_linspace(*args, **kwargs):
-            if 'device' in kwargs and kwargs['device'] == 'cuda':
-                kwargs['device'] = 'cpu'
-            return orig_linspace(*args, **kwargs)
-
-
-        torch.linspace = patched_linspace
-
-###################################################################################################
-#############         sonradan eklendi  ###########################################################
-###################################################################################################
-
     estimator = AltitudeEstimator(
         device=args.device, fx=fx,
         ema_alpha=0.2, min_altitude=5.0, max_altitude=500.0,
@@ -306,7 +364,7 @@ if __name__ == "__main__":
 
     cap, frame_count, size, fps = load_video(args.video)
 
-    print(f"\n🧪 İlk {args.max_frames} kare için irtifa tahmini...\n")
+    print(f"\n🧪 BÖLÜM 1: İrtifa Tahmini (ilk {args.max_frames} kare)\n")
 
     altitudes = []
     times = []
@@ -323,14 +381,6 @@ if __name__ == "__main__":
 
         print(f"   Kare {fid:>4d}: irtifa = {altitude:>7.2f}m  ({t.elapsed*1000:.0f}ms)")
 
-        # Derinlik haritası görselleştirme
-        if args.show_map and fid == 0:
-            depth_map = estimator.estimate_depth_map(frame)
-            depth_vis = (depth_map / depth_map.max() * 255).astype(np.uint8)
-            depth_color = cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
-            cv2.imwrite("depth_frame0.png", depth_color)
-            print(f"   📸 Derinlik haritası kaydedildi: depth_frame0.png")
-
     cap.release()
 
     if altitudes:
@@ -340,6 +390,31 @@ if __name__ == "__main__":
         print(f"   Min / Max       : {np.min(altitudes):.2f}m / {np.max(altitudes):.2f}m")
         print(f"   Ort. süre       : {np.mean(times)*1000:.0f}ms/kare")
 
+    # ── BÖLÜM 2: Combined API Doğrulaması ──
+    print(f"\n{'─' * 50}")
+    print(f"🧪 BÖLÜM 2: Combined API (estimate_altitude_and_depth)\n")
+
+    # EMA'yı sıfırla
+    estimator.reset()
+
+    cap2, _, _, _ = load_video(args.video)
+
+    for fid, frame in iter_frames(cap2):
+        if fid >= 3:
+            break
+
+        with Timer("combined") as t1:
+            alt_combined, dmap = estimator.estimate_altitude_and_depth(frame)
+
+        print(f"   Kare {fid}:")
+        print(f"     İrtifa:        {alt_combined:.2f}m")
+        print(f"     Depth map:     shape={dmap.shape}, "
+              f"min={dmap.min():.2f}m, max={dmap.max():.2f}m")
+        print(f"     Geçerli %:     {(dmap > 0).sum() / dmap.size * 100:.1f}%")
+        print(f"     Süre:          {t1.elapsed*1000:.0f}ms (tek inference)")
+
+    cap2.release()
+
     print(f"\n{'=' * 60}")
-    print("  ✅ Depth testi tamamlandı")
+    print("  ✅ Depth testi tamamlandı (v2 — combined API)")
     print("=" * 60)
