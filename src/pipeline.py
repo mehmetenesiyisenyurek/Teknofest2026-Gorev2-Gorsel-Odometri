@@ -24,7 +24,7 @@ Faz Yönetimi:
         Pozisyonu GT'ye sıfırla + kalibrasyon güncelle + GT gönder
 
 Bireysel test:
-    python -m src.pipeline --video /home/mei/Benim/PROJECTS/Teknofest26/src/data/THYZ_2026_Ornek_Veri_1.MP4 --gt /home/mei/Benim/PROJECTS/Teknofest26/src/data/THYZ_2026_Ornek_Veri_1_translation.csv  --max-frames 200 --gps-cut 50
+    python -m src.pipeline --video /home/mei/Benim/PROJECTS/Teknofest26/src/data/THYZ_2026_Ornek_Veri_1.MP4 --gt /home/mei/Benim/PROJECTS/Teknofest26/src/data/THYZ_2026_Ornek_Veri_1_translation.csv --max-frames 200 --gps-cut 50
 """
 
 import sys
@@ -34,6 +34,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
 import torch
 
 # --- DİNAMİK METRIC3D CUDA YAMASI (V2 - GRIC) ---
@@ -54,6 +55,9 @@ if not torch.cuda.is_available():
     torch.linspace = patched_linspace
 else:
     print("🚀 NVIDIA GPU (CUDA) algılandı! İki Yol Mimarisi tam performans çalışacak.")
+
+
+
 
 def load_ground_truth(gt_path):
     """
@@ -286,9 +290,8 @@ def run_pipeline(
             prev_feats = feats
             prev_frame = frame
 
-            # İlk kare için irtifa ve derinlik haritası
-            prev_altitude = depth_est.estimate_altitude(frame)
-            prev_depth_map = depth_est.estimate_depth_map(frame)
+            # İlk kare için irtifa ve derinlik haritası (tek inference)
+            prev_altitude, prev_depth_map = depth_est.estimate_altitude_and_depth(frame)
 
             # İlk kare sonucu
             if gt_pos is not None:
@@ -388,8 +391,8 @@ def run_pipeline(
                     dx, dy, dz = 0.0, 0.0, 0.0
                     pose_success = True
                 else:
-                    # İrtifa tahmini
-                    altitude = depth_est.estimate_altitude(frame)
+                    # İrtifa tahmini (tek inference — depth_map da güncellenir)
+                    altitude, cur_depth_map = depth_est.estimate_altitude_and_depth(frame)
                     if prev_altitude is None:
                         prev_altitude = altitude
 
@@ -398,6 +401,7 @@ def run_pipeline(
                     R = R_h
                     pose_success = True
                     prev_altitude = altitude
+                    prev_depth_map = cur_depth_map  # PnP için sakla
 
                 stats["homography_used"] += 1
             else:
@@ -433,11 +437,12 @@ def run_pipeline(
                     dy = float(t_metric[1])
                     # dz: PnP'den gelen z genelde gürültülü —
                     # irtifa farkından hesapla (Metric3D daha güvenilir)
-                    altitude = depth_est.estimate_altitude(frame)
+                    altitude, cur_depth_map = depth_est.estimate_altitude_and_depth(frame)
                     if prev_altitude is None:
                         prev_altitude = altitude
                     dz = altitude - prev_altitude
                     prev_altitude = altitude
+                    prev_depth_map = cur_depth_map  # PnP için sakla
 
                     pose_success = True
                     stats["pnp_used"] += 1
@@ -453,7 +458,7 @@ def run_pipeline(
             prev_frame = frame
 
             # Derinlik haritasını güncelle (bir sonraki keyframe için)
-            prev_depth_map = depth_est.estimate_depth_map(frame)
+            _, prev_depth_map = depth_est.estimate_altitude_and_depth(frame)
 
             last_pos = accumulator.get_position()
             results[fid] = tuple(last_pos) if last_pos is not None else (0, 0, 0)
@@ -515,10 +520,11 @@ def run_pipeline(
 
         # Derinlik haritasını güncelle (yedek yol bir sonraki sefer kullanabilir)
         # NOT: Her keyframe'de depth map hesaplamak pahalı.
-        # Sadece GRIC "essential" seçtiğinde veya ratio düşükse hesapla.
-        if selected_path == "essential" or (ratio is not None and ratio < 0.85):
-            prev_depth_map = depth_est.estimate_depth_map(frame)
-        # Aksi halde önceki depth_map kullanılmaya devam eder
+        # Birincil ve yedek yolda zaten estimate_altitude_and_depth ile güncellendi.
+        # Sadece salt rotasyon durumunda (depth hesaplanmadı) güncelle.
+        if not pose_success:
+            pass  # Başarısız durumda zaten yukarıda güncellendi
+        # Aksi halde prev_depth_map birincil/yedek yolda güncellendi
 
         # Verbose çıktı (her 10 keyframe'de)
         if verbose and keyframe_count % 10 == 0:

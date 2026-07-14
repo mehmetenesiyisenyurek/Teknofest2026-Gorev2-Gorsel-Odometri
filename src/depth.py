@@ -181,7 +181,7 @@ class AltitudeEstimator:
             self._preprocess_for_metric3d(frame_bgr)
 
         # ── Inference ──
-        pred_depth, confidence = self.model.inference({'input': input_tensor})
+        pred_depth, confidence, _ = self.model.inference({'input': input_tensor})
 
         # ── De-canonicalize ──
         # Metric3D canonical space'de üretir (focal=1000 varsayımı).
